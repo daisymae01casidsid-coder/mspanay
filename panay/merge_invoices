@@ -1,0 +1,304 @@
+<?php
+/**
+ * merge_invoices.php — backend handler for the invoice merge feature.
+ *
+ * Two actions, chosen by the `action` field in the request body:
+ *
+ *   action=merge
+ *     Body: { "primary_invoice": "INV_...523",
+ *             "merged_invoices": ["INV_...524","INV_...569"] }
+ *     - Marks every invoice in merged_invoices as merged INTO primary_invoice.
+ *     - Stores the full list of merged invoice numbers (JSON) on the primary's
+ *       merged_invoices column.
+ *     - Clears merged_invoices on the children and sets their merged_into to
+ *       the primary, so they can be hidden / filtered out by the dashboard.
+ *     - If the primary already has merged children, the new ones are appended
+ *       to the existing list (idempotent re-merge).
+ *
+ *   action=unmerge
+ *     Body: { "primary_invoice": "INV_...523" }
+ *     - Releases every invoice merged into the primary back to standalone.
+ *     - Clears merged_invoices on the primary and merged_into on its children.
+ *
+ * All responses are JSON: { "ok": true, ... } or
+ * { "ok": false, "error": "..." } with an appropriate HTTP status.
+ */
+
+declare(strict_types=1);
+
+session_start();
+header('Content-Type: application/json; charset=utf-8');
+header('X-Content-Type-Options: nosniff');
+
+require_once __DIR__ . '/db.php'; // gives us $pdo + ensureMergeColumns()
+
+if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+    http_response_code(405);
+    echo json_encode(['ok' => false, 'error' => 'Method not allowed. Use POST.']);
+    exit;
+}
+
+// Accept either JSON body or form-encoded body.
+$raw  = file_get_contents('php://input');
+$input = json_decode($raw, true);
+if (!is_array($input)) {
+    $input = $_POST;
+}
+
+$action = strtolower(trim((string)($input['action'] ?? 'merge')));
+
+try {
+    if ($action === 'merge') {
+        handleMerge($pdo, $input);
+    } elseif ($action === 'unmerge') {
+        handleUnmerge($pdo, $input);
+    } else {
+        http_response_code(400);
+        echo json_encode(['ok' => false, 'error' => "Unknown action: {$action}"]);
+    }
+} catch (Throwable $e) {
+    http_response_code(500);
+    echo json_encode(['ok' => false, 'error' => 'Server error: ' . $e->getMessage()]);
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Handlers                                                                  */
+/* -------------------------------------------------------------------------- */
+
+function handleMerge(PDO $pdo, array $input): void
+{
+    $primary = trim((string)($input['primary_invoice'] ?? ''));
+    $merged  = $input['merged_invoices'] ?? [];
+
+    if (!is_array($merged)) {
+        $merged = [$merged];
+    }
+    $merged = array_values(array_filter(
+        array_map('trim', array_map('strval', $merged)),
+        fn($x) => $x !== ''
+    ));
+    // A primary cannot be merged into itself.
+    $merged = array_values(array_diff($merged, [$primary]));
+
+    if ($primary === '') {
+        http_response_code(400);
+        echo json_encode(['ok' => false, 'error' => 'A primary invoice must be selected.']);
+        return;
+    }
+    if (count($merged) === 0) {
+        http_response_code(400);
+        echo json_encode(['ok' => false, 'error' => 'Select at least one invoice to merge into the primary.']);
+        return;
+    }
+
+    // Verify every invoice number exists in the table.
+    $allNumbers = array_merge([$primary], $merged);
+    $found = fetchExistingNumbers($pdo, $allNumbers);
+    $missing = array_diff($allNumbers, $found);
+    if (count($missing) > 0) {
+        http_response_code(404);
+        echo json_encode([
+            'ok'    => false,
+            'error' => 'Invoice number(s) not found: ' . implode(', ', $missing),
+        ]);
+        return;
+    }
+
+    // None of the children may already be a primary of their own children —
+    // that would create a two-level merge tree we don't support.
+    $childPlaceholders = implode(',', array_fill(0, count($merged), '?'));
+    $sql = "SELECT invoice_number FROM invoices
+            WHERE merged_into IS NULL
+              AND merged_invoices IS NOT NULL
+              AND merged_invoices != '[]'
+              AND invoice_number IN ($childPlaceholders)
+            LIMIT 1";
+    $chk = $pdo->prepare($sql);
+    $chk->execute($merged);
+    $busy = $chk->fetchColumn();
+    if ($busy) {
+        http_response_code(400);
+        echo json_encode([
+            'ok'    => false,
+            'error' => "Invoice {$busy} is itself a primary with merged children. Unmerge it first before using it as a merge target.",
+        ]);
+        return;
+    }
+
+    // If any of the children are currently merged into a DIFFERENT primary,
+    // pull them out of that other primary's list first. (Re-parenting.)
+    $otherParents = $pdo->prepare("SELECT invoice_number, merged_into
+                                   FROM invoices
+                                   WHERE invoice_number IN ($childPlaceholders)
+                                     AND merged_into IS NOT NULL
+                                     AND merged_into <> ''");
+    $otherParents->execute($merged);
+    $reparents = $otherParents->fetchAll(PDO::FETCH_KEY_PAIR); // [child => oldPrimary]
+
+    // Fetch the primary's existing merged list (could be empty).
+    $stmt = $pdo->prepare('SELECT merged_invoices FROM invoices WHERE invoice_number = ?');
+    $stmt->execute([$primary]);
+    $row = $stmt->fetch();
+    $existingList = json_decode($row['merged_invoices'] ?? '[]', true) ?: [];
+
+    // Remove from `existingList` any child that's currently parented elsewhere
+    // (we are re-parenting it to this primary).
+    if (!empty($reparents)) {
+        $existingList = array_values(array_diff($existingList, array_keys($reparents)));
+    }
+    // Final merged list on the primary = existing + new.
+    $finalList = array_values(array_unique(array_merge($existingList, $merged)));
+    sort($finalList);
+    $jsonList = json_encode($finalList);
+
+    $pdo->beginTransaction();
+    try {
+        // Update primary.
+        $updPrimary = $pdo->prepare(
+            'UPDATE invoices
+                SET merged_invoices = :list,
+                    merged_into     = NULL,
+                    updated_at      = NOW()
+              WHERE invoice_number  = :inv'
+        );
+        $updPrimary->execute([':list' => $jsonList, ':inv' => $primary]);
+
+        // Mark children. NOTE: use ALL positional placeholders (?), because
+        // mixing named + positional in one statement throws under
+        // PDO::ATTR_EMULATE_PREPARES = false (which db.php sets).
+        $updChild = $pdo->prepare(
+            "UPDATE invoices
+                SET merged_into     = ?,
+                    merged_invoices = NULL,
+                    updated_at      = NOW()
+              WHERE invoice_number IN ($childPlaceholders)"
+        );
+        $updChild->execute(array_merge([$primary], $merged));
+
+        // If we re-parented children away from another primary, rebuild that
+        // other primary's list so it no longer references them.
+        foreach (array_unique(array_values($reparents)) as $oldPrimary) {
+            $listStmt = $pdo->prepare(
+                "SELECT GROUP_CONCAT(invoice_number) AS kids
+                   FROM invoices
+                  WHERE merged_into = :p"
+            );
+            $listStmt->execute([':p' => $oldPrimary]);
+            $kids = $listStmt->fetchColumn();
+            $kidList = $kids ? json_encode(explode(',', $kids)) : json_encode([]);
+            $writeStmt = $pdo->prepare(
+                'UPDATE invoices
+                    SET merged_invoices = :list,
+                        updated_at      = NOW()
+                  WHERE invoice_number  = :inv'
+            );
+            $writeStmt->execute([':list' => $kidList, ':inv' => $oldPrimary]);
+        }
+
+        $pdo->commit();
+    } catch (Throwable $e) {
+        $pdo->rollBack();
+        throw $e;
+    }
+
+    echo json_encode([
+        'ok'              => true,
+        'action'          => 'merge',
+        'primary'         => $primary,
+        'merged_count'    => count($finalList),
+        'merged_invoices' => $finalList,
+        'reparented'      => array_keys($reparents),
+    ]);
+}
+
+function handleUnmerge(PDO $pdo, array $input): void
+{
+    $primary = trim((string)($input['primary_invoice'] ?? ''));
+
+    if ($primary === '') {
+        http_response_code(400);
+        echo json_encode(['ok' => false, 'error' => 'A primary invoice must be provided.']);
+        return;
+    }
+
+    // Confirm the primary exists.
+    $found = fetchExistingNumbers($pdo, [$primary]);
+    if (count($found) === 0) {
+        http_response_code(404);
+        echo json_encode(['ok' => false, 'error' => "Invoice not found: {$primary}"]);
+        return;
+    }
+
+    // Pull the list of children.
+    $kidsStmt = $pdo->prepare(
+        'SELECT invoice_number
+           FROM invoices
+          WHERE merged_into = :p
+          ORDER BY invoice_number'
+    );
+    $kidsStmt->execute([':p' => $primary]);
+    $kids = $kidsStmt->fetchAll(PDO::FETCH_COLUMN);
+
+    if (count($kids) === 0) {
+        echo json_encode([
+            'ok'             => true,
+            'action'         => 'unmerge',
+            'primary'        => $primary,
+            'released_count' => 0,
+            'released'       => [],
+        ]);
+        return;
+    }
+
+    $placeholders = implode(',', array_fill(0, count($kids), '?'));
+
+    $pdo->beginTransaction();
+    try {
+        // Release the children.
+        $rel = $pdo->prepare(
+            "UPDATE invoices
+                SET merged_into = NULL,
+                    updated_at  = NOW()
+              WHERE invoice_number IN ($placeholders)"
+        );
+        $rel->execute($kids);
+
+        // Clear the primary's list.
+        $clr = $pdo->prepare(
+            'UPDATE invoices
+                SET merged_invoices = NULL,
+                    updated_at      = NOW()
+              WHERE invoice_number  = ?'
+        );
+        $clr->execute([$primary]);
+
+        $pdo->commit();
+    } catch (Throwable $e) {
+        $pdo->rollBack();
+        throw $e;
+    }
+
+    echo json_encode([
+        'ok'             => true,
+        'action'         => 'unmerge',
+        'primary'        => $primary,
+        'released_count' => count($kids),
+        'released'       => $kids,
+    ]);
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Helpers                                                                   */
+/* -------------------------------------------------------------------------- */
+
+function fetchExistingNumbers(PDO $pdo, array $numbers): array
+{
+    $numbers = array_values(array_unique($numbers));
+    if (count($numbers) === 0) {
+        return [];
+    }
+    $placeholders = implode(',', array_fill(0, count($numbers), '?'));
+    $stmt = $pdo->prepare("SELECT invoice_number FROM invoices WHERE invoice_number IN ($placeholders)");
+    $stmt->execute($numbers);
+    return $stmt->fetchAll(PDO::FETCH_COLUMN);
+}
